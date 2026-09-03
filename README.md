@@ -1,5 +1,7 @@
 # Omagent
 
+![The Omagent pill with an answer in the card below it](screenshot.png)
+
 Omagent 0.1.0 is an alpha plugin for [Omarchy](https://omarchy.org).
 The pill is a small input bar at the top of the screen.
 
