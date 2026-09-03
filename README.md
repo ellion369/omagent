@@ -42,8 +42,8 @@ Then it sets the plugin to ON.
 2. Add the key and the layer rule:
 
 ```sh
-cat ~/.config/omarchy/plugins/ellion369.omagent/bindings.lua.install \
-    ~/.config/omarchy/plugins/ellion369.omagent/layerrule.lua.install \
+cat ~/.config/omarchy/plugins/io.github.ellion369.omagent/bindings.lua.install \
+    ~/.config/omarchy/plugins/io.github.ellion369.omagent/layerrule.lua.install \
     >> ~/.config/hypr/bindings.lua
 ```
 
@@ -141,7 +141,7 @@ NOTE: No test means that the adapter exists. We did not do a full test.
 If `SUPER+A` does nothing:
 
 1. Restart the shell with `omarchy-restart-shell`.
-2. Make sure that `~/.config/hypr/bindings.lua` contains `ellion369.omagent`.
+2. Make sure that `~/.config/hypr/bindings.lua` contains `io.github.ellion369.omagent`.
 
 If the card has no blur, add `layerrule.lua.install` to `~/.config/hypr/bindings.lua`.
 
@@ -160,7 +160,7 @@ journalctl --user -f | grep -i omagent
 ## Remove
 
 ```sh
-omarchy plugin remove ellion369.omagent
+omarchy plugin remove io.github.ellion369.omagent
 omarchy-restart-shell
 ```
 

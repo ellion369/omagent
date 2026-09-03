@@ -2,4 +2,4 @@
 -- Check `omarchy menu keybindings --print` first and choose an unused key.
 -- Auto-approve is toggled inside the pill with Shift+Tab; no second key needed.
 
-o.bind("SUPER + A", "Omagent", "omarchy-shell shell toggle ellion369.omagent")
+o.bind("SUPER + A", "Omagent", "omarchy-shell shell toggle io.github.ellion369.omagent")

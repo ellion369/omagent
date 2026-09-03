@@ -190,7 +190,7 @@ Item {
 
   readonly property string pluginDir: manifest && manifest["__sourceDir"]
     ? String(manifest["__sourceDir"])
-    : Quickshell.env("HOME") + "/.config/omarchy/plugins/ellion369.omagent"
+    : Quickshell.env("HOME") + "/.config/omarchy/plugins/io.github.ellion369.omagent"
   readonly property string routerPath: pluginDir + "/omagent-route"
 
   function open(payloadJson) {
@@ -213,7 +213,7 @@ Item {
 
   function dismiss() {
     if (root.shell && typeof root.shell.hide === "function")
-      root.shell.hide((root.manifest && root.manifest.id) || "ellion369.omagent")
+      root.shell.hide((root.manifest && root.manifest.id) || "io.github.ellion369.omagent")
     else root.close()
   }
 
