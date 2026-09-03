@@ -1,0 +1,603 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import uuid
+from collections import deque
+from pathlib import Path
+
+
+MAX_REQUEST_CHARS = 2000
+MAX_TEXT_CHARS = 4000
+MAX_TOOL_CHARS = 160
+MAX_STDERR_CHARS = 600
+DRY_RUN = os.environ.get("OMAGENT_DRY_RUN") == "1"
+DEBUG = os.environ.get("OMAGENT_DEBUG") == "1"
+
+PREAMBLE = (
+    "You are answering from Omagent, a small desktop overlay on Omarchy Linux "
+    "with very limited display space. Keep the reply concise, plain text, no "
+    "headings; do the task rather than describing a plan."
+)
+
+
+EMITTED_ERROR = False
+
+
+def emit(kind: str, **fields: object) -> None:
+    global EMITTED_ERROR
+    if kind == "error":
+        EMITTED_ERROR = True
+    print(json.dumps({"kind": kind, **fields}), flush=True)
+
+
+def clip(text: str, limit: int, *, collapse: bool = False) -> str:
+    text = " ".join(str(text).split()) if collapse else str(text).strip()
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+TOKEN_FIELDS = ("input", "output", "reasoning", "input_tokens", "output_tokens")
+
+
+def token_total(usage: object) -> int:
+    if not isinstance(usage, dict):
+        return 0
+    total = usage.get("total")
+    if isinstance(total, (int, float)):
+        return int(total)
+    return sum(int(usage[field]) for field in TOKEN_FIELDS
+               if isinstance(usage.get(field), (int, float)))
+
+
+def record_usage(state: dict, tokens: int, cost: object, *, cumulative: bool = False) -> None:
+    money = float(cost) if isinstance(cost, (int, float)) else None
+    if cumulative:
+        state["tokens"] = tokens
+        if money is not None:
+            state["cost"] = money
+    else:
+        state["tokens"] = state.get("tokens", 0) + tokens
+        if money is not None:
+            state["cost"] = state.get("cost", 0.0) + money
+    spent = state.get("cost")
+    seen = (state["tokens"], None if spent is None else round(spent, 6))
+    if seen == state.get("usageSeen") or not state["tokens"]:
+        return
+    state["usageSeen"] = seen
+    emit("usage", tokens=seen[0], cost=seen[1])
+
+
+def detached(command: list[str], *, cwd: Path | None = None) -> None:
+    if DRY_RUN:
+        emit("status", text="Would run: " + shlex.join(command))
+        return
+    subprocess.Popen(
+        command,
+        cwd=str(cwd) if cwd else None,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+AGENT_LABELS = {
+    "pi": "Pi",
+    "omp": "Oh My Pi",
+    "opencode": "OpenCode",
+    "claude": "Claude Code",
+    "codex": "Codex",
+    "crush": "Crush",
+    "grok": "Grok",
+    "gemini": "Gemini",
+    "copilot": "GitHub Copilot",
+}
+
+
+def work_dir() -> Path:
+    work = Path.home() / "Work"
+    return work if work.is_dir() else Path.home()
+
+
+def agent_label(slug: str) -> str:
+    return AGENT_LABELS.get(slug, slug)
+
+
+def default_agent() -> str:
+    agent_file = Path.home() / ".config/omarchy/defaults/agent"
+    try:
+        first = agent_file.read_text(errors="ignore").splitlines()[0].strip()
+        if first:
+            return first
+    except (OSError, IndexError):
+        pass
+    try:
+        result = subprocess.run(
+            ["omarchy-default-agent"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return result.stdout.strip()
+
+
+def extend_path() -> None:
+    home = Path.home()
+    extra = [str(home / ".local/bin"), str(home / ".local/share/mise/shims")]
+    current = os.environ.get("PATH", "").split(os.pathsep)
+    os.environ["PATH"] = os.pathsep.join(current + [p for p in extra if p not in current])
+
+
+def short_path(value: object) -> str:
+    text = str(value or "")
+    home = str(Path.home())
+    if text.startswith(home + "/"):
+        text = "~" + text[len(home):]
+    return text.rsplit("/", 1)[-1] if len(text) > 48 else text
+
+
+def summarize_tool(name: str, detail: object) -> str:
+    return clip(f"{name} {detail}".strip(), MAX_TOOL_CHARS, collapse=True)
+
+
+def opencode_argv(prompt: str, session: str, auto: bool) -> list[str]:
+    argv = ["opencode", "run", "--format", "json"]
+    if auto:
+        argv.append("--auto")
+    if session:
+        argv += ["-s", session]
+    return argv + [prompt]
+
+
+def claude_argv(prompt: str, session: str, pinned: str, auto: bool) -> list[str]:
+    argv = ["claude", "-p", "--output-format", "stream-json", "--verbose"]
+    if auto:
+        argv += ["--permission-mode", "auto"]
+    argv += ["--resume", session] if session else ["--session-id", pinned]
+    return argv + [prompt]
+
+
+def codex_argv(prompt: str, session: str, auto: bool) -> list[str]:
+    argv = ["codex", "exec", "--json", "--skip-git-repo-check"]
+    if auto:
+        argv.append("--approve-for-me")
+    if session:
+        argv += ["resume", session]
+    return argv + [prompt]
+
+
+def gemini_argv(prompt: str, session: str, pinned: str, auto: bool) -> list[str]:
+    argv = ["gemini", "-p", prompt, "-o", "stream-json"]
+    if auto:
+        argv.append("--yolo")
+    return argv + (["--resume", "latest"] if session else ["--session-id", pinned])
+
+
+def opencode_resume(session: str) -> list[str]:
+    return ["opencode", "-s", session] if session else []
+
+
+def claude_resume(session: str) -> list[str]:
+    return ["claude", "--resume", session] if session else []
+
+
+def codex_resume(session: str) -> list[str]:
+    return ["codex", "resume", session] if session else []
+
+
+def gemini_resume(session: str) -> list[str]:
+    return ["gemini", "--resume", "latest"] if session else []
+
+
+PERMISSION_REFUSED = re.compile(
+    r"permission requested:\s*(\S+)\s*\(([^)]*)\);\s*auto-rejecting")
+
+
+def permission_notice(line: str) -> str | None:
+    match = PERMISSION_REFUSED.search(line)
+    return match.group(1) if match else None
+
+
+OPENCODE_INPUT_FIELDS = ("filePath", "command", "pattern", "url", "query", "path")
+
+
+def opencode_event(event: dict, state: dict) -> None:
+    session = event.get("sessionID")
+    if isinstance(session, str) and session:
+        state["session"] = session
+    part = event.get("part")
+    if not isinstance(part, dict):
+        return
+    session = part.get("sessionID")
+    if isinstance(session, str) and session:
+        state["session"] = session
+    if part.get("type") == "step-finish":
+        record_usage(state, token_total(part.get("tokens")), part.get("cost"))
+        return
+    kind = event.get("type")
+    if kind == "text":
+        text = part.get("text")
+        if isinstance(text, str) and text.strip():
+            emit("text", text=clip(text, MAX_TEXT_CHARS))
+        return
+    if kind != "tool_use":
+        return
+    status = part.get("state") if isinstance(part.get("state"), dict) else {}
+    phase = status.get("status")
+    if phase not in {"completed", "error"}:
+        return
+    name = str(part.get("tool") or "tool")
+    title = status.get("title")
+    if not title:
+        args = status.get("input") if isinstance(status.get("input"), dict) else {}
+        detail = next((args[f] for f in OPENCODE_INPUT_FIELDS if args.get(f)), "")
+        title = summarize_tool(name.capitalize(), short_path(detail))
+    if phase == "error":
+        emit("tool", text=summarize_tool(name.capitalize(), "failed"))
+        error = str(status.get("error") or "")
+        needed = state.get("permission")
+        if needed and "rejected permission" in error:
+            error = (f"opencode asks before {needed}, and this pill cannot show "
+                     "you that question. Press Shift+Tab to turn on auto-approve "
+                     "and ask again, or Ctrl+E to answer it in opencode's own "
+                     "terminal.")
+        elif "specified a rule which prevents" in error:
+            error = ("Blocked by a deny rule in your opencode config. That rule "
+                     "applies in opencode too, so change it there if you want "
+                     "the agent doing this — or do this one yourself.")
+        elif "rejected permission" in error:
+            error = ("opencode needed permission this pill cannot ask for. "
+                     "Press Shift+Tab to turn on auto-approve and ask again, or "
+                     "Ctrl+E to answer it in opencode's own terminal.")
+        if error:
+            emit("error", text=clip(error, MAX_TEXT_CHARS))
+        return
+    emit("tool", text=clip(title, MAX_TOOL_CHARS, collapse=True))
+
+
+CLAUDE_TOOL_FIELDS = {
+    "Read": "file_path", "Edit": "file_path", "Write": "file_path",
+    "Glob": "pattern", "Grep": "pattern",
+    "WebFetch": "url", "WebSearch": "query",
+    "Task": "description",
+}
+
+
+def claude_event(event: dict, state: dict) -> None:
+    session = event.get("session_id")
+    if isinstance(session, str) and session:
+        state["session"] = session
+    if event.get("type") == "result":
+        record_usage(state, token_total(event.get("usage")),
+                     event.get("total_cost_usd"), cumulative=True)
+        if event.get("is_error"):
+            emit("error", text=clip(event.get("result") or "Claude reported an error", MAX_TEXT_CHARS))
+        return
+    if event.get("type") != "assistant":
+        return
+    message = event.get("message")
+    blocks = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(blocks, list):
+        return
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            text = block.get("text")
+            if isinstance(text, str) and text.strip():
+                emit("text", text=clip(text, MAX_TEXT_CHARS))
+        elif block.get("type") == "tool_use":
+            name = str(block.get("name") or "tool")
+            args = block.get("input") if isinstance(block.get("input"), dict) else {}
+            if name == "Bash":
+                detail = args.get("description") or args.get("command") or ""
+            else:
+                detail = args.get(CLAUDE_TOOL_FIELDS.get(name, ""), "")
+            emit("tool", text=summarize_tool(name, short_path(detail)))
+
+
+def codex_event(event: dict, state: dict) -> None:
+    kind = event.get("type")
+    if kind == "thread.started":
+        thread = event.get("thread_id")
+        if isinstance(thread, str) and thread:
+            state["session"] = thread
+        return
+    if kind == "turn.completed":
+        record_usage(state, token_total(event.get("usage")), None, cumulative=True)
+        return
+    if kind == "error":
+        emit("error", text=clip(event.get("message") or "Codex reported an error", MAX_TEXT_CHARS))
+        return
+    if kind != "item.completed":
+        return
+    item = event.get("item")
+    if not isinstance(item, dict):
+        return
+    item_type = item.get("item_type") or item.get("type")
+    if item_type == "agent_message":
+        text = item.get("text")
+        if isinstance(text, str) and text.strip():
+            emit("text", text=clip(text, MAX_TEXT_CHARS))
+    elif item_type == "command_execution":
+        emit("tool", text=summarize_tool("Ran", item.get("command") or ""))
+    elif item_type == "file_change":
+        changes = item.get("changes")
+        paths = [short_path(c.get("path")) for c in changes if isinstance(c, dict)] \
+            if isinstance(changes, list) else []
+        emit("tool", text=summarize_tool("Edited", ", ".join(paths) or short_path(item.get("path"))))
+    elif item_type == "mcp_tool_call":
+        emit("tool", text=summarize_tool(str(item.get("tool") or "MCP"), item.get("server") or ""))
+    elif item_type == "web_search":
+        emit("tool", text=summarize_tool("Searched", item.get("query") or ""))
+
+
+def flush_buffer(state: dict) -> None:
+    text = "".join(state.get("buffer") or []).strip()
+    state["buffer"] = []
+    if text:
+        emit("text", text=clip(text, MAX_TEXT_CHARS))
+
+
+def gemini_event(event: dict, state: dict) -> None:
+    kind = event.get("type")
+    if kind == "init":
+        session = event.get("session_id")
+        if isinstance(session, str) and session:
+            state["session"] = session
+        return
+    if kind == "message":
+        if event.get("role") == "assistant":
+            content = event.get("content")
+            if isinstance(content, str):
+                state.setdefault("buffer", []).append(content)
+        return
+    if kind == "tool_use":
+        flush_buffer(state)
+        params = event.get("parameters") if isinstance(event.get("parameters"), dict) else {}
+        detail = params.get("file_path") or params.get("path") or params.get("command") \
+            or params.get("pattern") or params.get("query") or ""
+        emit("tool", text=summarize_tool(str(event.get("tool_name") or "tool"), short_path(detail)))
+        return
+    if kind == "error":
+        flush_buffer(state)
+        emit("error", text=clip(event.get("message") or "Gemini reported an error", MAX_TEXT_CHARS))
+        return
+    if kind == "result":
+        flush_buffer(state)
+
+
+ADAPTERS = {
+    "opencode": {
+        "run": lambda prompt, session, pinned, auto: opencode_argv(prompt, session, auto),
+        "resume": opencode_resume,
+        "event": opencode_event,
+        "pins_session": False,
+    },
+    "claude": {
+        "run": claude_argv,
+        "resume": claude_resume,
+        "event": claude_event,
+        "pins_session": True,
+    },
+    "codex": {
+        "run": lambda prompt, session, pinned, auto: codex_argv(prompt, session, auto),
+        "resume": codex_resume,
+        "event": codex_event,
+        "pins_session": False,
+    },
+    "gemini": {
+        "run": gemini_argv,
+        "resume": gemini_resume,
+        "event": gemini_event,
+        "pins_session": True,
+    },
+}
+
+
+def run_agent(request: str, agent: str, session: str, auto: bool) -> int:
+    adapter = ADAPTERS[agent]
+    label = agent_label(agent)
+    cwd = work_dir()
+    prompt = request if session else PREAMBLE + "\n\n" + request
+    pinned = str(uuid.uuid4()) if adapter["pins_session"] and not session else ""
+    argv = adapter["run"](prompt, session, pinned, auto)
+
+    state: dict = {"session": session or pinned, "buffer": []}
+
+    def announce() -> None:
+        emit(
+            "agent",
+            name=agent,
+            label=label,
+            session=state["session"],
+            cwd=str(cwd),
+            resume=adapter["resume"](state["session"]),
+            resumeLabel="Expand",
+            pid=state.get("pid", 0),
+        )
+
+    announce()
+
+    if DRY_RUN:
+        emit("status", text="Would run: " + shlex.join(argv))
+        emit("done", ok=True, code=0, stopped=False)
+        return 0
+
+    try:
+        proc = subprocess.Popen(
+            argv,
+            cwd=str(cwd),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            start_new_session=True,
+        )
+    except OSError as error:
+        emit("error", text=f"Could not start {label}: {error}")
+        emit("done", ok=False, code=1, stopped=False)
+        return 1
+
+    state["pid"] = proc.pid
+    announce()
+
+    stderr_tail: deque[str] = deque(maxlen=20)
+
+    def drain_stderr() -> None:
+        assert proc.stderr is not None
+        for line in proc.stderr:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            stderr_tail.append(line)
+            permission = permission_notice(line)
+            if permission:
+                state["permission"] = permission
+
+    stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+    stderr_thread.start()
+
+    def stop(_signum: int, _frame: object) -> None:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+        except OSError:
+            pass
+        emit("status", text="Stopped")
+        emit("done", ok=False, code=130, stopped=True)
+        os._exit(130)
+
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, stop)
+
+    known_session = state["session"]
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            if DEBUG:
+                print(line, file=sys.stderr)
+            continue
+        if not isinstance(event, dict):
+            continue
+        try:
+            adapter["event"](event, state)
+        except (KeyError, TypeError, ValueError) as error:
+            if DEBUG:
+                print(f"adapter error: {error}", file=sys.stderr)
+            continue
+        if state["session"] != known_session:
+            known_session = state["session"]
+            announce()
+
+    flush_buffer(state)
+    code = proc.wait()
+    stderr_thread.join(timeout=1)
+    if code != 0 and not EMITTED_ERROR:
+        tail = clip("\n".join(stderr_tail), MAX_STDERR_CHARS, collapse=True)
+        emit("error", text=tail or f"{label} exited with code {code}")
+    emit("done", ok=code == 0, code=code, stopped=False)
+    return 0 if code == 0 else 1
+
+
+def route_agent(request: str, agent: str, session: str, auto: bool) -> int:
+    extend_path()
+    current = default_agent()
+    if agent and agent != current:
+        session = ""
+    slug = current
+    if not slug:
+        emit(
+            "agent",
+            name="", label="", session="", cwd=str(work_dir()),
+            resume=["omarchy-agent", "--pick"], resumeLabel="Choose agent",
+        )
+        emit("error", text="No default agent set. Press Ctrl+E to choose one.")
+        emit("done", ok=False, code=1, stopped=False)
+        return 1
+
+    label = agent_label(slug)
+    if not shutil.which(slug):
+        emit(
+            "agent",
+            name=slug, label=label, session="", cwd=str(work_dir()),
+            resume=["omarchy-default-agent", slug], resumeLabel="Install",
+        )
+        emit("error", text=f"{label} is not installed. Press Ctrl+E to install it.")
+        emit("done", ok=False, code=1, stopped=False)
+        return 1
+
+    if slug not in ADAPTERS:
+        emit(
+            "agent",
+            name=slug, label=label, session="", cwd=str(work_dir()),
+            resume=["omarchy-agent"], resumeLabel="Expand",
+        )
+        detached(["omarchy-agent", "--prompt", request])
+        emit("status", text=f"Opened {label}")
+        emit("done", ok=True, code=0, stopped=False)
+        return 0
+
+    return run_agent(request, slug, session, auto)
+
+
+def route_request(raw_request: str, *, agent: str = "", session: str = "",
+                  auto: bool = False) -> int:
+    if len(raw_request) > MAX_REQUEST_CHARS:
+        emit("error", text=f"Requests are limited to {MAX_REQUEST_CHARS} characters")
+        emit("done", ok=False, code=1, stopped=False)
+        return 1
+
+    request = raw_request.strip()
+    if not request:
+        emit("error", text="Request is empty")
+        emit("done", ok=False, code=1, stopped=False)
+        return 1
+    return route_agent(request, agent, session, auto)
+
+
+def main() -> int:
+    arguments = sys.argv[1:]
+    agent = ""
+    session = ""
+    auto = False
+    while arguments and arguments[0].startswith("--"):
+        option = arguments.pop(0)
+        if option == "--agent" and arguments:
+            agent = arguments.pop(0)
+        elif option == "--session" and arguments:
+            session = arguments.pop(0)
+        elif option == "--auto":
+            auto = True
+        else:
+            print(f"Unknown option: {option}", file=sys.stderr)
+            return 2
+    if len(arguments) != 1 or not arguments[0].strip():
+        print("Usage: omagent-route [--auto] [--agent SLUG --session ID] <request>",
+              file=sys.stderr)
+        return 2
+    return route_request(arguments[0], agent=agent, session=session, auto=auto)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

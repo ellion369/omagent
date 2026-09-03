@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Compile Python entry point
+        run: python -m py_compile omagent-route
+      - name: Validate manifest JSON
+        run: python -m json.tool manifest.json >/dev/null
+      - name: Check executable entry point
+        run: test -x omagent-route
+      - name: Dry-run smoke test
+        env:
+          OMAGENT_DRY_RUN: "1"
+        run: |
+          # The router refuses to run without a default agent, so stand one up:
+          # the defaults file it reads, and something on PATH for `which`.
+          mkdir -p "$HOME/.config/omarchy/defaults" stub-bin
+          echo opencode >"$HOME/.config/omarchy/defaults/agent"
+          printf '#!/bin/sh\nexit 0\n' >stub-bin/opencode
+          chmod +x stub-bin/opencode
+          export PATH="$PWD/stub-bin:$PATH"
+          ./omagent-route "what is in this directory" | tee events.jsonl
+          ./omagent-route --auto "what is in this directory" | tee auto.jsonl
+          python - <<'PY'
+          import json
+          for path, auto in (("events.jsonl", False), ("auto.jsonl", True)):
+              events = [json.loads(line) for line in open(path) if line.strip()]
+              kinds = [event["kind"] for event in events]
+              assert kinds[-1] == "done", kinds
+              assert events[-1]["ok"] is True, events[-1]
+              assert "agent" in kinds, kinds
+              argv = next(e["text"] for e in events if e["kind"] == "status")
+              assert ("--auto" in argv) is auto, (path, argv)
+          PY

@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.log
+.coverage
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+.env
+.env.*
+.agents/
+.claude/
+AGENTS.md
+CHANGELOG.md
+PLAN.md
+test_route.py

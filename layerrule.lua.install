@@ -1,0 +1,6 @@
+-- Append to ~/.config/hypr/bindings.lua alongside the Omagent binding.
+--
+-- The results card is translucent, so it needs the compositor to blur what is
+-- behind it to stay legible. ignore_alpha keeps the blur on the pill and card
+-- and off the scrim, which covers the whole screen at a much lower alpha.
+hl.layer_rule({ match = { namespace = "omarchy-omagent" }, blur = true, ignore_alpha = 0.6 })
