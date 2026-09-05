@@ -38,7 +38,7 @@ You can use [Voxtype](https://github.com/basecamp/voxtype) for the microphone bu
 1. Add the plugin:
 
 ```sh
-omarchy plugin add https://github.com/ellion369/omagent.git --enable
+omarchy plugin add https://github.com/ellion369/Omarchy-Omagent.git --enable
 ```
 
 This command copies the plugin.
