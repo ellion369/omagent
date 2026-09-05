@@ -1,6 +1,6 @@
 # Omagent
 
-![The Omagent pill with an answer in the card below it](screenshot.png)
+![Omagent command pill over dark winged-horse artwork](preview.jpg)
 
 Omagent 0.1.0 is an alpha plugin for [Omarchy](https://omarchy.org).
 The pill is a small input bar at the top of the screen.
@@ -24,6 +24,11 @@ You must have:
 - Omarchy 4 with the overlay `omarchy-shell`
 - Python 3.11 or a later version
 - A default agent (`omarchy default agent opencode`)
+- `wl-copy` from `wl-clipboard` for copying answers (included with Omarchy)
+
+The plugin uses Omarchy's agent, terminal, notification, and voice-status
+helpers. The selected agent must be installed and authenticated with its
+provider. Provider usage may cost money. Python uses only its standard library.
 
 Voxtype is not necessary.
 You can use [Voxtype](https://github.com/basecamp/voxtype) for the microphone button.
@@ -39,9 +44,18 @@ omarchy plugin add https://github.com/ellion369/omagent.git --enable
 This command copies the plugin.
 Then it sets the plugin to ON.
 
-2. Add the key and the layer rule:
+2. Check for an existing binding before adding the key and layer rule:
 
 ```sh
+omarchy menu keybindings --print
+```
+
+Review `bindings.lua.install` and `layerrule.lua.install` first. If `SUPER+A`
+is already assigned, choose an unused key in the binding snippet. Back up
+your configuration and append the snippets once:
+
+```sh
+cp ~/.config/hypr/bindings.lua ~/.config/hypr/bindings.lua.bak.$(date +%s)
 cat ~/.config/omarchy/plugins/io.github.ellion369.omagent/bindings.lua.install \
     ~/.config/omarchy/plugins/io.github.ellion369.omagent/layerrule.lua.install \
     >> ~/.config/hypr/bindings.lua
@@ -51,17 +65,27 @@ The plugin has no key before you add this text.
 The layer rule adds blur behind the card.
 If you do not add the layer rule, the card operates without blur.
 
+Check that Hyprland accepts the configuration:
+
+```sh
+hyprctl reload
+hyprctl configerrors
+```
+
 3. Restart the shell:
 
 ```sh
 omarchy-restart-shell
 ```
 
-NOTE: A plugin with `keepLoaded` does not load after a rescan.
+Restart after installation or QML updates so this keep-loaded overlay is
+instantiated with the current code.
 
 4. Press `SUPER+A` to open the pill.
 
 ## Operation
+
+![The Omagent pill with an answer in the card below it](screenshot.png)
 
 Write a request.
 Press Enter.
@@ -111,6 +135,10 @@ A new session sets the mode to Ask.
 A restart of the shell sets the mode to Ask.
 `Ctrl+E` opens the terminal of the agent without the auto-approve flag.
 
+These two modes apply to the four streaming adapters below. Other agents
+are handed to `omarchy agent`, which applies its own approval flags regardless
+of the pill's mode. The pill's AUTO setting does not control those terminal runs.
+
 **CAUTION:** Do not use auto-approve as a sandbox.
 The agent operates on your files.
 A deny rule for bash does not always stop the agent.
@@ -136,6 +164,16 @@ The other agents open a terminal with your request.
 
 NOTE: No test means that the adapter exists. We did not do a full test.
 
+The Gemini adapter currently resumes `latest`, so another Gemini session can
+change which conversation it opens. Use opencode for the verified workflow.
+
+## Saved data
+
+Omagent saves the last transcript, session ID, resume command, working
+directory, usage totals, and overlay position in
+`~/.local/state/omagent/last.json`. Auto-approve is not saved. The selected
+agent manages its own history, credentials, and provider connections.
+
 ## Problems
 
 If `SUPER+A` does nothing:
@@ -151,11 +189,15 @@ If you see `No default agent set`, set a default agent:
 omarchy default agent opencode
 ```
 
-If the pill opens but does not load, examine the shell log:
+For shell loading errors, examine the shell log:
 
 ```sh
 journalctl --user -f | grep -i omagent
 ```
+
+Plugin `console.log` messages may not appear there. Router errors appear in
+the card. `OMAGENT_DRY_RUN=1 ./omagent-route -- "your request"` checks the
+selected command from a repository checkout without running the agent.
 
 ## Remove
 

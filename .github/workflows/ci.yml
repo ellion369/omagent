@@ -32,8 +32,9 @@ jobs:
           printf '#!/bin/sh\nexit 0\n' >stub-bin/opencode
           chmod +x stub-bin/opencode
           export PATH="$PWD/stub-bin:$PATH"
-          ./omagent-route "what is in this directory" | tee events.jsonl
-          ./omagent-route --auto "what is in this directory" | tee auto.jsonl
+          ./omagent-route -- "what is in this directory" | tee events.jsonl
+          ./omagent-route --auto -- "what is in this directory" | tee auto.jsonl
+          ./omagent-route -- --auto | tee literal.jsonl
           python - <<'PY'
           import json
           for path, auto in (("events.jsonl", False), ("auto.jsonl", True)):
@@ -44,4 +45,10 @@ jobs:
               assert "agent" in kinds, kinds
               argv = next(e["text"] for e in events if e["kind"] == "status")
               assert ("--auto" in argv) is auto, (path, argv)
+          import shlex
+          events = [json.loads(line) for line in open("literal.jsonl") if line.strip()]
+          argv = shlex.split(next(e["text"] for e in events if e["kind"] == "status").removeprefix("Would run: "))
+          assert events[-1]["ok"] is True, events[-1]
+          assert "--auto" not in argv[:-1], argv
+          assert argv[-1].endswith("\n\n--auto"), argv
           PY

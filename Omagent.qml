@@ -20,6 +20,7 @@ Item {
   property bool sawError: false
   property bool expectedStop: false
   property bool pendingExpand: false
+  property bool pendingNewSession: false
   property string agentName: ""
   property string agentLabel: ""
   property string sessionId: ""
@@ -46,7 +47,7 @@ Item {
   readonly property string stateDir: Quickshell.env("HOME") + "/.local/state/omagent"
   readonly property string statePath: root.stateDir + "/last.json"
 
-  readonly property bool busy: root.runState === "running" || root.runState === "detached"
+  readonly property bool busy: runner.running || root.runState === "running" || root.runState === "detached"
   readonly property bool stoppable: root.busy
 
   readonly property bool hasSession: root.agentName !== "" && root.sessionId !== ""
@@ -153,13 +154,13 @@ Item {
     root.sawAgent = root.agentName !== ""
     root.followTail = true
 
-    if (String(data.runState) === "running" && root.runPid > 0) {
+    if ((String(data.runState) === "running" || String(data.runState) === "detached") && root.runPid > 0) {
       root.runState = "interrupted"
       probe.command = ["kill", "-0", String(root.runPid)]
       probe.running = true
     } else {
       root.runState = String(data.runState || "idle")
-      if (root.runState === "running") root.runState = "interrupted"
+      if (root.runState === "running" || root.runState === "detached") root.runState = "interrupted"
     }
     Qt.callLater(root.scrollToEnd)
     Qt.callLater(function() { panel.keepInBounds(); root.save() })
@@ -278,7 +279,7 @@ Item {
     var argv = [root.routerPath]
     if (root.autoMode) argv.push("--auto")
     if (root.hasSession) argv = argv.concat(["--agent", root.agentName, "--session", root.sessionId])
-    argv.push(request)
+    argv.push("--", request)
     runner.command = argv
     runner.running = true
     prompt.text = ""
@@ -326,6 +327,11 @@ Item {
   }
 
   function finish(code) {
+    if (root.pendingNewSession) {
+      root.pendingNewSession = false
+      root.newSession()
+      return
+    }
     root.markElapsed()
     root.priorTokens += root.runTokens
     root.priorCost += root.runCost
@@ -386,9 +392,12 @@ Item {
     var home = Quickshell.env("HOME")
     var cwd = root.agentCwd || home
     if (root.resumeLabel === "Expand") {
-      var appId = "org.omarchy.omagent." + (root.sessionId || "session")
+      var appId = "org.omarchy.omagent." + (root.sessionId || "session").replace(/[^A-Za-z0-9_.-]/g, "_")
       Quickshell.execDetached({
-        command: ["omarchy-launch-or-focus-tui", "--app-id=" + appId].concat(root.resumeArgv),
+        command: ["omarchy-launch-or-focus-tui", "--app-id=" + appId].concat(
+          root.resumeArgv.map(function(arg) {
+            return "'" + String(arg).replace(/'/g, "'\\''") + "'"
+          })),
         workingDirectory: cwd
       })
     } else {
@@ -413,6 +422,12 @@ Item {
   }
 
   function newSession() {
+    if (runner.running) {
+      root.pendingNewSession = true
+      root.pendingExpand = false
+      root.stopRun()
+      return
+    }
     root.stopRun()
     entries.clear()
     root.agentName = ""
@@ -491,6 +506,7 @@ Item {
     onExited: function(exitCode) {
       root.runState = exitCode === 0 ? "detached" : "interrupted"
       if (exitCode !== 0) root.runPid = 0
+      root.save()
     }
   }
 
@@ -1049,8 +1065,10 @@ Item {
                   color: row.isNote ? Color.muted : Color.menu.text
                   opacity: row.isNote ? 1 : 0.95
                   text: {
-                    if (row.rowExpanded)
-                      return "\u2304 " + row.rowLines.split("\n").join("\n\u00b7 ")
+                    if (row.rowExpanded) {
+                      var expanded = "\u2304 " + row.rowLines.split("\n").join("\n\u00b7 ")
+                      return row.rowKind === "status" ? root.emphasizeKeys(expanded) : expanded
+                    }
                     if (row.rowCount > 1)
                       return "\u203a " + row.rowCount + " steps \u00b7 " + row.rowText
                     if (row.isError) return root.emphasizeKeys(row.rowText)

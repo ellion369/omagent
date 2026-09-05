@@ -155,7 +155,7 @@ def opencode_argv(prompt: str, session: str, auto: bool) -> list[str]:
         argv.append("--auto")
     if session:
         argv += ["-s", session]
-    return argv + [prompt]
+    return argv + ["--", prompt]
 
 
 def claude_argv(prompt: str, session: str, pinned: str, auto: bool) -> list[str]:
@@ -163,7 +163,7 @@ def claude_argv(prompt: str, session: str, pinned: str, auto: bool) -> list[str]
     if auto:
         argv += ["--permission-mode", "auto"]
     argv += ["--resume", session] if session else ["--session-id", pinned]
-    return argv + [prompt]
+    return argv + ["--", prompt]
 
 
 def codex_argv(prompt: str, session: str, auto: bool) -> list[str]:
@@ -172,7 +172,7 @@ def codex_argv(prompt: str, session: str, auto: bool) -> list[str]:
         argv.append("--approve-for-me")
     if session:
         argv += ["resume", session]
-    return argv + [prompt]
+    return argv + ["--", prompt]
 
 
 def gemini_argv(prompt: str, session: str, pinned: str, auto: bool) -> list[str]:
@@ -583,7 +583,9 @@ def main() -> int:
     auto = False
     while arguments and arguments[0].startswith("--"):
         option = arguments.pop(0)
-        if option == "--agent" and arguments:
+        if option == "--":
+            break
+        elif option == "--agent" and arguments:
             agent = arguments.pop(0)
         elif option == "--session" and arguments:
             session = arguments.pop(0)
